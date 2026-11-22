@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Remote-ID Karte</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  :root { --bg:#12161c; --fg:#e8edf3; --mut:#8b97a6; --acc:#ff8a3d; --ok:#3ecf8e; --line:#252c36; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--fg); font:15px/1.35 system-ui, sans-serif; }
+  #app { display:flex; flex-direction:column; height:100%; height:100dvh; }
+  header { display:flex; gap:8px; align-items:center; padding:8px 10px; border-bottom:1px solid var(--line); flex-wrap:wrap; }
+  button { background:#1d2430; color:var(--fg); border:1px solid #33405066; border-radius:8px; padding:8px 12px; font:inherit; }
+  button.pri { background:var(--acc); color:#1a1006; border-color:var(--acc); font-weight:600; }
+  #status { color:var(--mut); font-size:13px; flex:1 1 140px; min-width:0; }
+  #status b { color:var(--fg); font-weight:600; }
+  #map { flex:1 1 55%; min-height:200px; background:#0c0f13; }
+  #list { flex:0 0 38%; overflow:auto; border-top:1px solid var(--line); padding-bottom:env(safe-area-inset-bottom); }
+  .row { padding:9px 12px; border-bottom:1px solid var(--line); }
+  .row.stale { opacity:.45; }
+  .row .t { display:flex; justify-content:space-between; gap:8px; font-weight:600; }
+  .row .s { color:var(--mut); font-size:13px; margin-top:2px; }
+  .tag { color:var(--acc); font-weight:600; }
+  .empty { padding:18px 12px; color:var(--mut); }
+  .dr { font-size:22px; line-height:22px; text-align:center; color:var(--acc); text-shadow:0 0 3px #000, 0 0 6px #000; }
+  .dr.stale { color:#8b97a6; }
+  .op { font-size:18px; line-height:18px; text-align:center; text-shadow:0 0 3px #000; }
+  .leaflet-container { font-family:inherit; }
+  #warn { display:none; padding:10px 12px; background:#3a2a10; color:#ffd9a0; font-size:13px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="warn"></div>
+  <header>
+    <button class="pri" id="btnConn">USB verbinden</button>
+    <button id="btnUsb">WebUSB</button>
+    <button id="btnDemo">Demo</button>
+    <button id="btnFit">Alle</button>
+    <button id="btnMe">📍</button>
+    <div id="status">Nicht verbunden</div>
+  </header>
+  <div id="map"></div>
+  <div id="list"><div class="empty">Keine Drohnen empfangen.</div></div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+// ==DECODER== (ASTM F3411 / OpenDroneID, je 25 Byte pro Nachricht)
+const UA_TYPES = ['Keine Angabe','Flächenflugzeug','Multicopter/Hubschrauber','Gyrocopter','VTOL','Ornithopter','Segler','Drachen','Freiballon','Fesselballon','Luftschiff','Fallschirm','Rakete','Gefesselt','Bodenhindernis','Sonstige'];
+const ID_TYPES = ['Keine','Seriennummer','CAA-Registrierung','UTM-ID','Session-ID'];
+const STATUS = ['Unbekannt','Am Boden','In der Luft','Notfall','System-Fehler'];
+
+function ascii(b, o, n) {
+  let s = '';
+  for (let i = o; i < o + n; i++) {
+    const c = b[i];
+    if (c === 0) break;
+    s += (c >= 32 && c < 127) ? String.fromCharCode(c) : '?';
+  }
+  return s;
+}
+function alt(dv, o) { const r = dv.getUint16(o, true); return r === 0xFFFF ? null : r * 0.5 - 1000; }
+function coord(dv, o) { return dv.getInt32(o, true) / 1e7; }
+
+function decodeMsg(b) {
+  const dv = new DataView(b.buffer, b.byteOffset, 25);
+  const type = b[0] >> 4;
+  if (type === 0) {
+    return { type: 'basic', idType: ID_TYPES[b[1] >> 4] || '?', uaType: UA_TYPES[b[1] & 15] || '?', id: ascii(b, 2, 20) };
+  }
+  if (type === 1) {
+    const mult = b[1] & 1, ew = (b[1] >> 1) & 1;
+    let dir = b[2]; dir = dir > 179 ? null : (ew ? dir + 180 : dir);
+    let spd = b[3] === 255 ? null : (mult ? b[3] * 0.75 + 63.75 : b[3] * 0.25);
+    let vs = b[4] > 127 ? b[4] - 256 : b[4]; vs = vs === 63 || b[4] === 126 ? null : vs * 0.5;
+    const lat = coord(dv, 5), lon = coord(dv, 9);
+    const valid = !(lat === 0 && lon === 0) && Math.abs(lat) <= 90 && Math.abs(lon) <= 180;
+    return { type: 'loc', status: STATUS[b[1] >> 4] || '?', dir, spd, vs, lat, lon, valid,
+             baro: alt(dv, 13), geo: alt(dv, 15), h: alt(dv, 17) };
+  }
+  if (type === 3) return { type: 'self', text: ascii(b, 2, 23) };
+  if (type === 4) {
+    const lat = coord(dv, 2), lon = coord(dv, 6);
+    return { type: 'sys', oplat: lat, oplon: lon, opvalid: !(lat === 0 && lon === 0), opalt: alt(dv, 18) };
+  }
+  if (type === 5) return { type: 'opid', id: ascii(b, 2, 20) };
+  return { type: 'other' };
+}
+
+function hexToBytes(h) {
+  const out = new Uint8Array(h.length >> 1);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(h.substr(i * 2, 2), 16);
+  return out;
+}
+// ==/DECODER==
+
+// ---------- Zustand ----------
+const drones = new Map();   // key = MAC
+let me = null, meMarker = null, meAcc = null;
+let counts = { w: 0, b: 0, lines: 0 };
+let hb = null, connected = false;
+
+function getDrone(mac) {
+  let d = drones.get(mac);
+  if (!d) { d = { mac, trail: [], last: 0, first: Date.now() }; drones.set(mac, d); }
+  return d;
+}
+
+function handleLine(line) {
+  line = line.trim();
+  if (!line || line[0] !== '{') return;
+  let j; try { j = JSON.parse(line); } catch (e) { return; }
+  if (j.hb) { hb = j; return; }
+  if (!j.m || !j.d || !/^[0-9a-f]+$/i.test(j.d) || j.d.length % 50) return;
+  counts.lines++; counts[j.t === 'b' ? 'b' : 'w']++;
+  const bytes = hexToBytes(j.d);
+  const d = getDrone(j.m);
+  d.src = j.t === 'b' ? 'BLE' : 'WiFi';
+  d.rssi = j.r; d.last = Date.now();
+  for (let o = 0; o + 25 <= bytes.length; o += 25) {
+    const m = decodeMsg(bytes.subarray(o, o + 25));
+    if (m.type === 'basic') { d.id = m.id || d.id; d.idType = m.idType; d.uaType = m.uaType; }
+    else if (m.type === 'loc') {
+      Object.assign(d, { status: m.status, dir: m.dir, spd: m.spd, vs: m.vs, baro: m.baro, geo: m.geo, h: m.h });
+      if (m.valid) {
+        d.lat = m.lat; d.lon = m.lon;
+        const t = d.trail[d.trail.length - 1];
+        if (!t || t[0] !== m.lat || t[1] !== m.lon) { d.trail.push([m.lat, m.lon]); if (d.trail.length > 200) d.trail.shift(); }
+      }
+    }
+    else if (m.type === 'self') d.self = m.text;
+    else if (m.type === 'sys') { if (m.opvalid) { d.oplat = m.oplat; d.oplon = m.oplon; } d.opalt = m.opalt; }
+    else if (m.type === 'opid') d.opid = m.id;
+  }
+  draw(d);
+}
+
+// ---------- Karte ----------
+const map = L.map('map', { zoomControl: true }).setView([51.34, 12.37], 12);
+// OSM wie gehabt; nur wenn keine Kachel lädt (z.B. lokale Datei ohne Referer), Ersatz über Esri.
+let tilesFallback = false;
+const tiles = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  maxZoom: 19, attribution: '&copy; OpenStreetMap'
+}).addTo(map);
+tiles.on('tileerror', () => {
+  if (tilesFallback) return; tilesFallback = true;
+  map.removeLayer(tiles);
+  L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}', {
+    maxZoom: 19, attribution: 'Tiles &copy; Esri'
+  }).addTo(map);
+});
+let didFit = false;
+
+function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
+function name(d) { return d.id || d.self || d.mac; }
+function f(v, u, dig = 0) { return v == null || isNaN(v) ? '–' : v.toFixed(dig) + u; }
+function dist(a, b, c, e) {
+  const R = 6371000, r = Math.PI / 180;
+  const x = (e - b) * r * Math.cos((a + c) / 2 * r), y = (c - a) * r;
+  return Math.sqrt(x * x + y * y) * R;
+}
+function icon(d, stale) {
+  const rot = d.dir == null ? 0 : d.dir;
+  return L.divIcon({ className: '', iconSize: [24, 24], iconAnchor: [12, 12],
+    html: '<div class="dr' + (stale ? ' stale' : '') + '" style="transform:rotate(' + rot + 'deg)">▲</div>' });
+}
+function popup(d) {
+  return '<b>' + esc(name(d)) + '</b><br>' + esc(d.uaType || '') + '<br>Höhe: ' + f(d.geo != null ? d.geo : d.baro, ' m') +
+    ' · ' + f(d.spd, ' m/s', 1) + '<br>' + (d.self ? esc(d.self) + '<br>' : '') + (d.opid ? 'Betreiber: ' + esc(d.opid) : '');
+}
+function draw(d) {
+  if (d.lat == null) return;
+  if (!d.marker) {
+    d.marker = L.marker([d.lat, d.lon], { icon: icon(d, false) }).addTo(map).bindPopup(() => popup(d));
+    d.line = L.polyline([], { color: '#ff8a3d', weight: 2, opacity: .7 }).addTo(map);
+    if (!didFit) { map.setView([d.lat, d.lon], 16); didFit = true; }
+  }
+  d.marker.setLatLng([d.lat, d.lon]).setIcon(icon(d, false));
+  d.line.setLatLngs(d.trail);
+  if (d.oplat != null) {
+    if (!d.opMarker) d.opMarker = L.marker([d.oplat, d.oplon], { icon: L.divIcon({ className: '', iconSize: [18, 18], iconAnchor: [9, 9], html: '<div class="op">🧑</div>' }) }).addTo(map).bindTooltip('Pilot');
+    d.opMarker.setLatLng([d.oplat, d.oplon]);
+  }
+}
+
+// ---------- Liste ----------
+function renderList() {
+  const now = Date.now(), el = document.getElementById('list');
+  for (const [k, d] of drones) {
+    const age = (now - d.last) / 1000;
+    if (age > 300) { [d.marker, d.line, d.opMarker].forEach(x => x && map.removeLayer(x)); drones.delete(k); continue; }
+    if (d.marker) d.marker.setIcon(icon(d, age > 30));
+  }
+  const arr = [...drones.values()].sort((a, b) => b.last - a.last);
+  if (!arr.length) { el.innerHTML = '<div class="empty">Keine Drohnen empfangen.</div>'; }
+  else {
+    el.innerHTML = arr.map(d => {
+      const age = Math.round((now - d.last) / 1000);
+      const dd = (me && d.lat != null) ? dist(me.lat, me.lon, d.lat, d.lon) : null;
+      const pos = d.lat != null ? '' : ' · <span class="tag">keine Position</span>';
+      return '<div class="row' + (age > 30 ? ' stale' : '') + '" data-k="' + esc(d.mac) + '">' +
+        '<div class="t"><span>' + esc(name(d)) + '</span><span class="tag">' + esc(d.status || '') + '</span></div>' +
+        '<div class="s">' + esc(d.uaType || '') + ' · ' + f(d.geo != null ? d.geo : d.baro, ' m') + ' (AGL ' + f(d.h, ' m') + ') · ' +
+        f(d.spd, ' m/s', 1) + (dd != null ? ' · ' + (dd >= 1000 ? (dd / 1000).toFixed(2) + ' km' : Math.round(dd) + ' m') : '') + '</div>' +
+        '<div class="s">' + d.src + ' ' + esc(d.rssi) + ' dBm · ' + age + ' s her' + pos + (d.opid ? ' · Op ' + esc(d.opid) : '') + '</div></div>';
+    }).join('');
+  }
+  const st = document.getElementById('status');
+  if (connected) errMsg = '';
+  const gTxt = geoErr ? ' · ' + esc(geoErr) : '';
+  st.innerHTML = (connected ? '<b>Verbunden</b>' : (errMsg ? esc(errMsg) : 'Nicht verbunden')) + ' · ' + arr.length + ' Drohne(n) · WiFi ' + counts.w + ' / BLE ' + counts.b;
+}
+document.getElementById('list').addEventListener('click', e => {
+  const r = e.target.closest('.row'); if (!r) return;
+  const d = drones.get(r.dataset.k);
+  if (d && d.marker) { map.setView([d.lat, d.lon], Math.max(map.getZoom(), 16)); d.marker.openPopup(); }
+});
+document.getElementById('btnFit').onclick = () => {
+  const pts = [];
+  drones.forEach(d => { if (d.lat != null) pts.push([d.lat, d.lon]); });
+  if (me) pts.push([me.lat, me.lon]);
+  if (pts.length) map.fitBounds(pts, { padding: [40, 40], maxZoom: 17 });
+};
+setInterval(renderList, 1000);
+
+// ---------- Eigener Standort ----------
+let geoId = null, geoErr = '';
+function onPos(p, center) {
+  geoErr = '';
+  me = { lat: p.coords.latitude, lon: p.coords.longitude };
+  if (!meMarker) {
+    meMarker = L.circleMarker([me.lat, me.lon], { radius: 8, color: '#fff', weight: 3, fillColor: '#2563eb', fillOpacity: 1 }).addTo(map);
+    meAcc = L.circle([me.lat, me.lon], { radius: p.coords.accuracy, color: '#2563eb', weight: 1, fillOpacity: .1 }).addTo(map);
+    if (!didFit) { map.setView([me.lat, me.lon], 16); didFit = true; }
+  } else { meMarker.setLatLng([me.lat, me.lon]); meAcc.setLatLng([me.lat, me.lon]).setRadius(p.coords.accuracy); }
+  if (center) map.setView([me.lat, me.lon], Math.max(map.getZoom(), 16));
+}
+function startGeo(center) {
+  if (!('geolocation' in navigator)) { geoErr = 'Standort nicht verfügbar'; return; }
+  if (geoId != null) navigator.geolocation.clearWatch(geoId);
+  geoId = navigator.geolocation.watchPosition(p => { onPos(p, center); center = false; }, e => {
+    geoErr = e.code === 1 ? 'Standort abgelehnt (Chrome: Seiteneinstellungen → Standort erlauben)' :
+             e.code === 2 ? 'Standort nicht verfügbar (GPS an?)' : 'Standort: Zeitüberschreitung';
+  }, { enableHighAccuracy: true, maximumAge: 5000, timeout: 20000 });
+}
+startGeo(false);
+document.getElementById('btnMe').onclick = () => { if (me) map.setView([me.lat, me.lon], Math.max(map.getZoom(), 16)); startGeo(true); };
+
+// ---------- USB / Web Serial ----------
+let port = null, reader = null, keepReading = false;
+const btn = document.getElementById('btnConn');
+
+async function readLoop() {
+  const dec = new TextDecoder();
+  let buf = '';
+  while (keepReading && port && port.readable) {
+    reader = port.readable.getReader();
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        let i;
+        while ((i = buf.indexOf('\n')) >= 0) { handleLine(buf.slice(0, i)); buf = buf.slice(i + 1); }
+        if (buf.length > 4000) buf = '';
+      }
+    } catch (e) { /* Kabel gezogen o.ä. */ }
+    finally { try { reader.releaseLock(); } catch (e) {} }
+    break;
+  }
+  await disconnect();
+}
+
+async function connect() {
+  if (!('serial' in navigator)) {
+    const w = document.getElementById('warn');
+    w.style.display = 'block';
+    w.textContent = 'Web Serial wird hier nicht unterstützt. Bitte die Seite in Chrome auf Android öffnen (nicht in einer eingebetteten Ansicht), per HTTPS.';
+    return;
+  }
+  try {
+    port = await navigator.serial.requestPort();
+    await port.open({ baudRate: 115200 });
+    try { await port.setSignals({ dataTerminalReady: true, requestToSend: false }); } catch (e) {}
+    connected = true; keepReading = true;
+    btn.textContent = 'Trennen';
+    readLoop();
+  } catch (e) {
+    port = null; connected = false;
+    showErr('Fehler: ' + (e && e.message ? e.message : e));
+  }
+}
+async function disconnect() {
+  keepReading = false; connected = false; usbOn = false;
+  try { if (reader) await reader.cancel(); } catch (e) {}
+  try { if (port) await port.close(); } catch (e) {}
+  try { if (usbDev) await usbDev.close(); } catch (e) {}
+  port = null; usbDev = null;
+  btn.textContent = 'USB verbinden'; btnUsb.textContent = 'WebUSB';
+}
+btn.onclick = () => connected ? disconnect() : connect();
+
+// ---------- WebUSB (Fallback für Android, wenn Web Serial das Gerät nicht listet) ----------
+let usbDev = null, usbOn = false, lineBuf = '';
+const btnUsb = document.getElementById('btnUsb');
+function feed(text) {
+  lineBuf += text;
+  let i;
+  while ((i = lineBuf.indexOf('\n')) >= 0) { handleLine(lineBuf.slice(0, i)); lineBuf = lineBuf.slice(i + 1); }
+  if (lineBuf.length > 4000) lineBuf = '';
+}
+let errMsg = '';
+function showErr(t) { errMsg = t; }
+async function connectUSB() {
+  if (!navigator.usb) { showErr('WebUSB wird hier nicht unterstützt.'); return; }
+  try {
+    usbDev = await navigator.usb.requestDevice({ filters: [{ vendorId: 0x303a }] });
+    await usbDev.open();
+    if (!usbDev.configuration) await usbDev.selectConfiguration(1);
+    let ctrl = null, dataIf = null, epIn = null;
+    for (const i of usbDev.configuration.interfaces) {
+      const a = i.alternates[0];
+      if (a.interfaceClass === 0x02) ctrl = i.interfaceNumber;
+      if (a.interfaceClass === 0x0a) {
+        dataIf = i.interfaceNumber;
+        for (const e of a.endpoints) if (e.direction === 'in' && e.type === 'bulk') epIn = e.endpointNumber;
+      }
+    }
+    if (dataIf == null || epIn == null) throw new Error('Keine CDC-Schnittstelle gefunden');
+    if (ctrl != null) { try { await usbDev.claimInterface(ctrl); } catch (e) {} }
+    await usbDev.claimInterface(dataIf);
+    // DTR setzen, sonst sendet der ESP32-S3 (USB-Serial/JTAG) nichts
+    await usbDev.controlTransferOut({ requestType: 'class', recipient: 'interface', request: 0x22, value: 0x01, index: ctrl != null ? ctrl : 0 });
+    connected = true; usbOn = true; lineBuf = '';
+    btnUsb.textContent = 'Trennen';
+    const dec = new TextDecoder();
+    while (usbOn) {
+      const r = await usbDev.transferIn(epIn, 512);
+      if (r.status === 'ok') feed(dec.decode(r.data, { stream: true }));
+      else if (r.status === 'stall') await usbDev.clearHalt('in', epIn);
+    }
+  } catch (e) {
+    if (usbOn || connected) showErr('USB getrennt: ' + (e && e.message ? e.message : e));
+    else showErr('Fehler: ' + (e && e.message ? e.message : e));
+  } finally {
+    await disconnect();
+  }
+}
+btnUsb.onclick = () => connected ? disconnect() : connectUSB();
+if ('serial' in navigator) navigator.serial.addEventListener('disconnect', () => disconnect());
+
+// ---------- Demo (ohne Hardware) ----------
+let demoT = null;
+function demoFrame(t) {
+  const lat = 51.34 + 0.002 * Math.sin(t / 20), lon = 12.37 + 0.003 * Math.cos(t / 20);
+  const m = new Uint8Array(75);
+  m[0] = 0x02; m[1] = 0x12; 'DEMO-DRONE-0001'.split('').forEach((c, i) => m[2 + i] = c.charCodeAt(0));
+  m[25] = 0x12; m[26] = 0x20 | 0; m[27] = (Math.floor((t * 9) % 180)); m[28] = 48; m[29] = 0;
+  const dv = new DataView(m.buffer);
+  dv.setInt32(30, Math.round(lat * 1e7), true); dv.setInt32(34, Math.round(lon * 1e7), true);
+  dv.setUint16(38, (1000 + 80) * 2, true); dv.setUint16(40, (1000 + 90) * 2, true); dv.setUint16(42, (1000 + 60) * 2, true);
+  m[50] = 0x42; dv.setInt32(52, Math.round(51.3385 * 1e7), true); dv.setInt32(56, Math.round(12.3665 * 1e7), true);
+  return '{"t":"w","m":"de:ad:be:ef:00:01","r":-62,"d":"' + [...m].map(x => x.toString(16).padStart(2, '0')).join('') + '"}';
+}
+document.getElementById('btnDemo').onclick = () => {
+  if (demoT) { clearInterval(demoT); demoT = null; return; }
+  let t = 0; demoT = setInterval(() => handleLine(demoFrame(t++)), 500);
+};
+</script>
+</body>
+</html>
